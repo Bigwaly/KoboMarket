@@ -1,6 +1,25 @@
+
+// Load environment variables before configuring PostgreSQL.
+require('dotenv').config();
+
 // Import Pool from the pg package.
 // Pool manages multiple PostgreSQL connections efficiently.
 const { Pool } = require('pg');
+
+// Determine whether the application is running Jest tests.
+const isTestEnvironment = process.env.NODE_ENV === 'test';
+
+// Select the correct database for the current environment.
+const database = isTestEnvironment
+  ? process.env.PG_TEST_DATABASE
+  : process.env.PG_DATABASE;
+
+// Never allow tests to fall back to the development database.
+if (isTestEnvironment && !database) {
+  throw new Error(
+    'PG_TEST_DATABASE must be configured before running database tests.'
+  );
+}
 
 // Create a connection pool for PostgreSQL.
 const postgresPool = new Pool({
@@ -10,13 +29,14 @@ const postgresPool = new Pool({
   // PostgreSQL server port.
   port: Number(process.env.PG_PORT),
 
-  // Database name.
-  database: process.env.PG_DATABASE,
+  // Use the dedicated test database during Jest tests.
+  // Otherwise, use the normal development database.
+  database,
 
-  // Database username.
+  // PostgreSQL database username.
   user: process.env.PG_USER,
 
-  // Database password.
+  // PostgreSQL database password.
   password: process.env.PG_PASSWORD,
 
   // Maximum number of connections in the pool.

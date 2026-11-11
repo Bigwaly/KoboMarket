@@ -11,7 +11,8 @@ const ALLOWED_TRANSACTION_TYPES = [
   'commission',
   'refund',
   'payout',
-  'adjustment'
+  'adjustment',
+  'reversal'
 ];
 
 // PostgreSQL BIGINT maximum value.
@@ -118,6 +119,33 @@ function validateOptionalIdentifier(value, fieldName) {
   return cleanedValue;
 }
 
+// Validate the UUID of an existing ledger transaction.
+function validateTransactionId(transactionId) {
+
+  // Transaction IDs must be supplied as strings.
+  if (typeof transactionId !== 'string') {
+    throw createServiceError(
+      'Transaction ID must be a valid UUID.'
+    );
+  }
+
+  // Remove unnecessary surrounding spaces.
+  const cleanedId = transactionId.trim();
+
+  // Validate the canonical UUID format.
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (!uuidPattern.test(cleanedId)) {
+    throw createServiceError(
+      'Transaction ID must be a valid UUID.'
+    );
+  }
+
+  // Return the normalised UUID.
+  return cleanedId.toLowerCase();
+}
+
 // Create and post a balanced ledger transaction.
 //
 // Expected input:
@@ -149,7 +177,16 @@ async function createLedgerTransaction({
   description,
   reference = null,
   idempotencyKey = null,
-  entries
+  reversesTransactionId = null,
+
+  // Internal exception used only when reversing historical transactions.
+  // Ordinary transactions must continue using active ledger accounts.
+  allowInactiveAccounts = false,
+
+  entries,
+  // Optional existing PostgreSQL connection.
+  // When supplied, the caller controls the transaction.
+  client: suppliedClient = null
 }) {
 
   // --------------------------------------------------
@@ -177,6 +214,23 @@ async function createLedgerTransaction({
     idempotencyKey,
     'Idempotency key'
   );
+
+// Validate the original transaction ID for reversal transactions.
+const cleanReversesTransactionId =
+  reversesTransactionId === null
+    ? null
+    : validateTransactionId(reversesTransactionId);
+
+// A reversal must reference its original transaction.
+// Ordinary transactions must not contain a reversal link.
+if (
+  (transactionType === 'reversal' && !cleanReversesTransactionId) ||
+  (transactionType !== 'reversal' && cleanReversesTransactionId)
+) {
+  throw createServiceError(
+    'Only reversal transactions may reference an original transaction, and every reversal must provide that reference.'
+  );
+}
 
   // --------------------------------------------------
   // STEP 2: VALIDATE THE LEDGER ENTRIES
@@ -257,14 +311,27 @@ async function createLedgerTransaction({
   const accountIds = [...new Set(
     validatedEntries.map((entry) => entry.accountId)
   )];
+// Determine whether this function owns the database connection.
+const ownsConnection = suppliedClient === null;
 
-  // Obtain a dedicated PostgreSQL connection.
-  const client = await postgresPool.connect();
+// Use the supplied connection when available.
+// Otherwise, obtain a dedicated connection from the pool.
+const client = suppliedClient || await postgresPool.connect();
 
-  try {
+// Reject an invalid externally supplied connection.
+if (typeof client.query !== 'function') {
+  throw createServiceError(
+    'A valid PostgreSQL client connection is required.'
+  );
+}
 
-    // Begin an atomic PostgreSQL database transaction.
+try {
+
+  // Start a transaction only when this function owns the connection.
+  // An external caller has already started its own transaction.
+  if (ownsConnection) {
     await client.query('BEGIN');
+  }
 
     // --------------------------------------------------
     // STEP 4: VERIFY THAT ALL ACCOUNTS EXIST AND ARE ACTIVE
@@ -297,23 +364,29 @@ async function createLedgerTransaction({
     }
 
     // Reject accounts that have been deactivated.
-    const inactiveAccounts = accountResult.rows.filter(
-      (account) => account.status !== 'active'
-    );
+   // Identify accounts that are currently inactive.
+const inactiveAccounts = accountResult.rows.filter(
+  (account) => account.status !== 'active'
+);
 
-    if (inactiveAccounts.length > 0) {
-      throw createServiceError(
-        `Inactive ledger accounts cannot be used: ${
-          inactiveAccounts.map((account) => account.account_code).join(', ')
-        }.`
-      );
-    }
+// Ordinary transactions cannot use inactive accounts.
+// Reversals are exempt because historical postings must remain reversible.
+if (
+  inactiveAccounts.length > 0 &&
+  !allowInactiveAccounts
+) {
+  throw createServiceError(
+    `Inactive ledger accounts cannot be used: ${
+      inactiveAccounts.map((account) => account.account_code).join(', ')
+    }.`
+  );
+}
 
 
     // --------------------------------------------------
     // STEP 5: CREATE THE PENDING TRANSACTION HEADER
     // --------------------------------------------------
-
+  
     // Attempt to create a new pending transaction.
     // If the idempotency key already exists, PostgreSQL
     // will not create a duplicate transaction.
@@ -325,20 +398,30 @@ async function createLedgerTransaction({
           status,
           reference,
           idempotency_key,
-          description
+          description,
+          reverses_transaction_id
         )
-        VALUES ($1, $2, 'pending', $3, $4, $5)
+        VALUES ($1, $2, 'pending', $3, $4, $5, $6)
         ON CONFLICT (idempotency_key) DO NOTHING
-        RETURNING id, transaction_type, status, reference, description, created_at
+        RETURNING
+          id,
+          transaction_type,
+          status,
+          reference,
+          description,
+          reverses_transaction_id,
+          created_at
       `,
       [
         transactionId,
         transactionType,
         cleanReference,
         cleanIdempotencyKey,
-        cleanDescription
+        cleanDescription,
+        cleanReversesTransactionId
       ]
     );
+
 
     // If no row was inserted, this idempotency key already exists.
     if (transactionResult.rows.length === 0) {
@@ -352,6 +435,7 @@ async function createLedgerTransaction({
             status,
             reference,
             description,
+	    reverses_transaction_id,
             created_at,
             posted_at
           FROM ledger_transactions
@@ -391,11 +475,12 @@ async function createLedgerTransaction({
         description: entry.description
       }));
 
-      // Compare the transaction header.
-      const sameTransactionDetails =
-        existingTransaction.transaction_type === transactionType &&
-        existingTransaction.reference === cleanReference &&
-        existingTransaction.description === cleanDescription;
+      // Compare the transaction header, including its reversal relationship.
+const sameTransactionDetails =
+  existingTransaction.transaction_type === transactionType &&
+  existingTransaction.reference === cleanReference &&
+  existingTransaction.description === cleanDescription &&
+  existingTransaction.reverses_transaction_id === cleanReversesTransactionId;
 
       // Compare every ledger entry.
       const sameLedgerEntries =
@@ -410,9 +495,11 @@ async function createLedgerTransaction({
         );
       }
 
-      // This is an identical retry. No new entries are created.
-      await client.query('COMMIT');
-
+  // This is an identical retry. No new entries are created.
+// Commit only when this function owns the connection.
+if (ownsConnection) {
+  await client.query('COMMIT');
+}
       // Return the original transaction.
       return {
         success: true,
@@ -483,10 +570,12 @@ async function createLedgerTransaction({
     // STEP 8: COMMIT THE DATABASE TRANSACTION
     // --------------------------------------------------
 
-    // All operations succeeded.
-    // Permanently save the transaction header and entries together.
-    await client.query('COMMIT');
-
+   // All ledger operations succeeded.
+// Commit only when this function owns the connection.
+// Otherwise, the calling service will commit everything.
+if (ownsConnection) {
+  await client.query('COMMIT');
+}
     // Return a useful result to the application.
     return {
       success: true,
@@ -502,14 +591,19 @@ async function createLedgerTransaction({
     // --------------------------------------------------
     // STEP 9: ROLL BACK IF ANY OPERATION FAILS
     // --------------------------------------------------
-
-    // Undo every database change made since BEGIN.
-    try {
-      await client.query('ROLLBACK');
-    } catch (rollbackError) {
-      // Preserve the original error if rollback also fails.
-      console.error('Ledger transaction rollback failed:', rollbackError);
-    }
+// Roll back only when this function owns the connection.
+// An external caller is responsible for rolling back its transaction.
+if (ownsConnection) {
+  try {
+    await client.query('ROLLBACK');
+  } catch (rollbackError) {
+    // Preserve the original error if rollback also fails.
+    console.error(
+      'Ledger transaction rollback failed:',
+      rollbackError
+    );
+  }
+}
 
     // PostgreSQL error code 23505 means a unique constraint was violated.
     if (error.code === '23505') {
@@ -529,14 +623,332 @@ async function createLedgerTransaction({
     // Pass all other errors to the calling application.
     throw error;
 
+ } finally {
+
+  // Release only connections obtained by this function.
+  // Never release a connection owned by another service.
+  if (ownsConnection) {
+    client.release();
+  }
+}
+}
+
+// Create a ledger transaction using a connection owned by another service.
+// The calling service controls BEGIN, COMMIT, ROLLBACK and release.
+async function createLedgerTransactionWithClient({
+  client,
+  ...transactionData
+}) {
+
+  // A caller must supply an existing PostgreSQL client.
+  if (!client || typeof client.query !== 'function') {
+    throw createServiceError(
+      'A valid PostgreSQL client connection must be supplied.'
+    );
+  }
+
+  // Reuse the existing ledger engine.
+  // Passing the client prevents it from managing the transaction itself.
+  return createLedgerTransaction({
+    ...transactionData,
+    client
+  });
+}
+
+// Reverse an existing posted ledger transaction.
+//
+// The original transaction and its entries are never modified.
+// A new transaction is created with every debit and credit swapped.
+//
+// The caller must provide an idempotency key so that retries
+// cannot accidentally create duplicate financial reversals.
+async function reverseLedgerTransaction({
+  transactionId,
+  idempotencyKey
+}) {
+
+  // --------------------------------------------------
+  // STEP 1: VALIDATE THE REVERSAL REQUEST
+  // --------------------------------------------------
+
+  // Validate and normalise the original transaction UUID.
+  const cleanTransactionId =
+    validateTransactionId(transactionId);
+
+  // Validate the supplied idempotency key.
+  const cleanIdempotencyKey =
+    validateOptionalIdentifier(
+      idempotencyKey,
+      'Idempotency key'
+    );
+
+  // A reversal must always have an idempotency key.
+  if (!cleanIdempotencyKey) {
+    throw createServiceError(
+      'An idempotency key is required to reverse a ledger transaction.'
+    );
+  }
+
+  // Use a deterministic description.
+  // This ensures retries generate exactly the same transaction details.
+  const reversalDescription =
+    `Reversal of transaction ${cleanTransactionId}`;
+
+  // --------------------------------------------------
+  // STEP 2: OBTAIN A POSTGRESQL CONNECTION
+  // --------------------------------------------------
+
+  const client = await postgresPool.connect();
+
+  try {
+
+    // Start one database transaction for the entire reversal.
+    await client.query('BEGIN');
+
+    // --------------------------------------------------
+    // STEP 3: LOCK AND VALIDATE THE ORIGINAL TRANSACTION
+    // --------------------------------------------------
+
+    // Lock the original transaction.
+    // Concurrent reversal requests must wait for this lock.
+    const originalResult = await client.query(
+      `
+        SELECT
+          id,
+          transaction_type,
+          status
+        FROM ledger_transactions
+        WHERE id = $1
+        FOR UPDATE
+      `,
+      [cleanTransactionId]
+    );
+
+    const originalTransaction = originalResult.rows[0];
+
+    // Reject transactions that do not exist.
+    if (!originalTransaction) {
+      throw createServiceError(
+        'Ledger transaction was not found.',
+        404,
+        'TRANSACTION_NOT_FOUND'
+      );
+    }
+
+    // A reversal must never reverse another reversal.
+    if (originalTransaction.transaction_type === 'reversal') {
+      throw createServiceError(
+        'A reversal transaction cannot itself be reversed.',
+        409,
+        'REVERSAL_NOT_ALLOWED'
+      );
+    }
+
+    // Only successfully posted transactions can be reversed.
+    if (originalTransaction.status !== 'posted') {
+      throw createServiceError(
+        'Only posted ledger transactions can be reversed.',
+        409,
+        'TRANSACTION_NOT_POSTED'
+      );
+    }
+
+    // --------------------------------------------------
+    // STEP 4: CHECK FOR AN EXISTING REVERSAL
+    // --------------------------------------------------
+
+    // Check whether this original transaction already has a reversal.
+    const existingReversalResult = await client.query(
+      `
+        SELECT
+          id,
+          idempotency_key,
+          status
+        FROM ledger_transactions
+        WHERE reverses_transaction_id = $1
+        FOR SHARE
+      `,
+      [originalTransaction.id]
+    );
+
+    const existingReversal =
+      existingReversalResult.rows[0];
+
+    // If another request already reversed this transaction,
+    // only an identical idempotency key may retry the operation.
+    if (existingReversal) {
+
+      // Reject a different idempotency key.
+      if (
+        existingReversal.idempotency_key !==
+        cleanIdempotencyKey
+      ) {
+        throw createServiceError(
+          'This ledger transaction has already been reversed.',
+          409,
+          'TRANSACTION_ALREADY_REVERSED'
+        );
+      }
+
+      // An existing reversal must already be posted.
+      if (existingReversal.status !== 'posted') {
+        throw createServiceError(
+          'The existing reversal is not in a completed state.',
+          409,
+          'REVERSAL_NOT_POSTED'
+        );
+      }
+    }
+
+    // --------------------------------------------------
+    // STEP 5: LOAD THE ORIGINAL LEDGER ENTRIES
+    // --------------------------------------------------
+
+    // Retrieve the original entries in a deterministic order.
+    const originalEntriesResult = await client.query(
+      `
+        SELECT
+          account_id,
+          entry_type,
+          amount,
+          description
+        FROM ledger_entries
+        WHERE transaction_id = $1
+        ORDER BY id ASC
+      `,
+      [originalTransaction.id]
+    );
+
+    // A posted transaction should already have valid entries.
+    // Still, verify that entries exist before constructing a reversal.
+    if (originalEntriesResult.rows.length < 2) {
+      throw createServiceError(
+        'The original transaction does not contain enough ledger entries to reverse.',
+        409,
+        'INVALID_ORIGINAL_LEDGER_ENTRIES'
+      );
+    }
+
+    // --------------------------------------------------
+    // STEP 6: SWAP THE ORIGINAL DEBITS AND CREDITS
+    // --------------------------------------------------
+
+    const reversalEntries = originalEntriesResult.rows.map(
+      (entry) => ({
+
+        // Reuse the exact original ledger account.
+        accountId: String(entry.account_id),
+
+        // Convert every debit into a credit,
+        // and every credit into a debit.
+        entryType:
+          entry.entry_type === 'debit'
+            ? 'credit'
+            : 'debit',
+
+        // Preserve the exact original amount in kobo.
+        amount: String(entry.amount),
+
+        // Give every reversing entry a clear explanation.
+        description:
+          `Reversal of: ${entry.description}`
+      })
+    );
+
+    // --------------------------------------------------
+    // STEP 7: CREATE AND POST THE REVERSAL
+    // --------------------------------------------------
+
+    // Reuse the existing ledger engine.
+    // It will validate the entries, enforce double-entry
+    // accounting, insert the new entries and post the transaction.
+    const reversalResult =
+      await createLedgerTransactionWithClient({
+
+        // Reuse the connection and transaction opened above.
+        client,
+
+        // Identify this transaction as a reversal.
+        transactionType: 'reversal',
+
+        // Keep the header description deterministic.
+        description: reversalDescription,
+
+        // Reversals do not need an external reference.
+        reference: null,
+
+        // Reuse the mandatory idempotency key.
+        idempotencyKey: cleanIdempotencyKey,
+
+        // Link this reversal to its original transaction.
+        reversesTransactionId: originalTransaction.id,
+
+        // Use the swapped original entries.
+        entries: reversalEntries,
+
+        // Permit inactive accounts for historical reversals.
+        // Account existence is still checked by the ledger engine.
+        allowInactiveAccounts: true
+      });
+
+    // --------------------------------------------------
+    // STEP 8: COMMIT THE REVERSAL
+    // --------------------------------------------------
+
+    // Commit the new header and entries together.
+    await client.query('COMMIT');
+
+    // Return the result from the existing ledger engine.
+    return {
+      ...reversalResult,
+      message: 'Ledger transaction reversed successfully.'
+    };
+
+  } catch (error) {
+
+    // --------------------------------------------------
+    // STEP 9: ROLL BACK IF ANY OPERATION FAILS
+    // --------------------------------------------------
+
+    // Roll back the entire reversal.
+    // This prevents partially completed financial operations.
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+
+      // Preserve the original error if rollback also fails.
+      console.error(
+        'Ledger reversal rollback failed:',
+        rollbackError
+      );
+    }
+
+    // Handle a concurrent reversal protected by the unique index.
+    if (
+      error.code === '23505' &&
+      error.constraint ===
+        'ledger_transactions_reverses_transaction_unique'
+    ) {
+      throw createServiceError(
+        'This ledger transaction has already been reversed.',
+        409,
+        'TRANSACTION_ALREADY_REVERSED'
+      );
+    }
+
+    // Pass all other errors to the calling application.
+    throw error;
+
   } finally {
 
-    // Always return the connection to the PostgreSQL pool.
+    // Release the connection after success or failure.
     client.release();
   }
 }
 
-// Export the ledger transaction service.
+// Export all ledger transaction operations.
 module.exports = {
-  createLedgerTransaction
+  createLedgerTransaction,
+  createLedgerTransactionWithClient,
+  reverseLedgerTransaction
 };

@@ -1,3 +1,4 @@
+
 // Insert the predefined system ledger accounts into the database.
 
 // Export the seed function.
@@ -31,36 +32,27 @@ exports.seed = async function (knex) {
     }
   ];
 
-  // Process each system account separately.
-  for (const account of systemAccounts) {
+  // Insert the system accounts.
+  // PostgreSQL ignores any account code that already exists.
+  // This also prevents duplicate insertion if two seed processes run together.
+  const insertedAccounts = await knex('ledger_accounts')
+    .insert(systemAccounts)
+    .onConflict('account_code')
+    .ignore()
+    .returning(['account_code', 'account_name']);
 
-    // Check whether an account with this code already exists.
-    const existingAccount = await knex('ledger_accounts')
-      .where({ account_code: account.account_code })
-      .first();
+  // Log only accounts that were actually created.
+  for (const account of insertedAccounts) {
 
-    // Insert the account only when it does not already exist.
-    if (!existingAccount) {
-      await knex('ledger_accounts').insert(account);
-
-      // Log the account that was created.
-      console.log(
-        'Created system ledger account:',
-        account.account_code,
-        account.account_name
-      );
-
-    } else {
-
-      // Preserve existing account information.
-      console.log(
-        'System ledger account already exists:',
-        account.account_code,
-        account.account_name
-      );
-    }
+    console.log(
+      'Created system ledger account:',
+      account.account_code,
+      account.account_name
+    );
   }
 
-  // Confirm that the seed has finished.
-  console.log('System ledger account seed completed.');
+  // Report how many accounts were inserted.
+  console.log(
+    `System ledger account seed completed. ${insertedAccounts.length} account(s) created.`
+  );
 };
