@@ -10,6 +10,9 @@ const cors = require('cors');
 // Load the authentication routes.
 const authRoutes = require('./modules/auth/routes/auth.routes');
 
+// Load the payment routes.
+const paymentRoutes = require('./modules/payments/routes/payment.routes');
+
 // Create the Express application.
 const app = express();
 
@@ -61,6 +64,12 @@ app.get('/health', (req, res) => {
 // Example:
 // POST /api/auth/register
 app.use('/api/auth', authRoutes);
+
+// All payment endpoints begin with /api/payments.
+//
+// Example:
+// POST /api/payments/initialize
+app.use('/api/payments', paymentRoutes);
 
 // --------------------------------------------------
 // STEP 5: NOT FOUND HANDLER
