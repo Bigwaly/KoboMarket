@@ -9,28 +9,64 @@ const { Pool } = require('pg');
 // Determine whether the application is running Jest tests.
 const isTestEnvironment = process.env.NODE_ENV === 'test';
 
+// Determine whether this is the dedicated payment integration test.
+const isPaymentIntegrationTest =
+  process.env.PAYMENT_INTEGRATION_TEST === 'true';
+
+// Payment integration tests must run under NODE_ENV=test.
+if (isPaymentIntegrationTest && !isTestEnvironment) {
+  throw new Error(
+    'Payment integration tests must run with NODE_ENV=test.'
+  );
+}
+
 // Select the correct database for the current environment.
-const database = isTestEnvironment
-  ? process.env.PG_TEST_DATABASE
-  : process.env.PG_DATABASE;
+const database = !isTestEnvironment
+  ? process.env.PG_DATABASE
+  : isPaymentIntegrationTest
+    ? process.env.PG_PAYMENT_TEST_DATABASE
+    : process.env.PG_TEST_DATABASE;
 
 // Never allow tests to fall back to the development database.
 if (isTestEnvironment && !database) {
   throw new Error(
-    'PG_TEST_DATABASE must be configured before running database tests.'
+    isPaymentIntegrationTest
+      ? 'PG_PAYMENT_TEST_DATABASE must be configured before running payment integration tests.'
+      : 'PG_TEST_DATABASE must be configured before running database tests.'
+  );
+}
+
+// Identify the development and ordinary test databases.
+const developmentDatabase = process.env.PG_DATABASE;
+const regularTestDatabase = process.env.PG_TEST_DATABASE;
+
+// Never allow a test environment to use the development database.
+if (isTestEnvironment && database === developmentDatabase) {
+  throw new Error(
+    'PostgreSQL test database must be different from the development database.'
+  );
+}
+
+// Payment integration tests must have their own separate database.
+if (
+  isPaymentIntegrationTest &&
+  database === regularTestDatabase
+) {
+  throw new Error(
+    'Payment integration database must be different from the regular test database.'
   );
 }
 
 // Create a connection pool for PostgreSQL.
 const postgresPool = new Pool({
+
   // PostgreSQL server address.
   host: process.env.PG_HOST,
 
   // PostgreSQL server port.
   port: Number(process.env.PG_PORT),
 
-  // Use the dedicated test database during Jest tests.
-  // Otherwise, use the normal development database.
+  // Use the selected database for the current environment.
   database,
 
   // PostgreSQL database username.
@@ -51,15 +87,19 @@ const postgresPool = new Pool({
 
 // Test the PostgreSQL connection.
 const connectPostgres = async () => {
+
   // Check out a connection from the pool.
   const client = await postgresPool.connect();
 
   try {
+
     // Run a simple query to confirm the connection.
     await client.query('SELECT 1');
 
     console.log('PostgreSQL connected successfully.');
+
   } finally {
+
     // Return the connection to the pool.
     client.release();
   }

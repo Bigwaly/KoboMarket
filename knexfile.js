@@ -78,4 +78,38 @@ module.exports = {
       directory: './src/database/seeds',
     },
   },
+
+  // --------------------------------------------------
+  // PAYMENT INTEGRATION TEST DATABASE
+  // --------------------------------------------------
+  paymentIntegrationTest: {
+
+    client: 'pg',
+
+    connection: {
+      host: process.env.PG_HOST,
+      port: Number(process.env.PG_PORT),
+
+      // Never fall back to either existing database.
+      database: process.env.PG_PAYMENT_TEST_DATABASE,
+
+      user: process.env.PG_USER,
+      password: process.env.PG_PASSWORD,
+    },
+
+    pool: {
+      min: 1,
+      max: 5,
+    },
+
+    migrations: {
+      directory: './src/database/migrations',
+      tableName: 'knex_migrations',
+    },
+
+    seeds: {
+      directory: './src/database/seeds',
+    },
+  },
+
 };
