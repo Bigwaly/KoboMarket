@@ -1,0 +1,450 @@
+openapi: 3.0.3
+
+info:
+  title: KoboMarket API
+  version: 1.0.0
+  description: |
+    API specification for the KoboMarket multi-vendor marketplace backend.
+
+    The current implementation provides customer registration, login,
+    email verification, payment initialization and verification,
+    and vendor product creation.
+
+    Marketplace features such as checkout, orders, escrow, payouts,
+    disputes and refunds are not yet implemented.
+
+servers:
+  - url: http://localhost:4000
+    description: Local development server
+
+tags:
+  - name: Health
+  - name: Authentication
+  - name: Payments
+  - name: Products
+
+paths:
+  /health:
+    get:
+      security: []
+      tags:
+        - Health
+      summary: Check API health
+      responses:
+        '200':
+          description: API is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /api/auth/register:
+    post:
+      security: []
+      tags:
+        - Authentication
+      summary: Register a customer
+      description: Creates a customer account and attempts to send a verification email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Customer account created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      user:
+                        type: object
+                        description: Safe customer profile returned by the service.
+                      verificationEmailSent:
+                        type: boolean
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: Registration conflict
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/auth/login:
+    post:
+      security: []
+      tags:
+        - Authentication
+      summary: Log in a customer
+      description: Rate-limited endpoint. Returns access and refresh tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Login successful.
+                  data:
+                    type: object
+                    properties:
+                      user:
+                        type: object
+                      accessToken:
+                        type: string
+                      refreshToken:
+                        type: string
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Authentication failed
+        '403':
+          description: Account or email verification restriction
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/auth/verify-email:
+    post:
+      security: []
+      tags:
+        - Authentication
+      summary: Verify customer email address
+      description: Rate-limited endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+      responses:
+        '200':
+          description: Email verified successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      user:
+                        type: object
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/auth/resend-verification:
+    post:
+      security: []
+      tags:
+        - Authentication
+      summary: Resend email verification
+      description: Rate-limited endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResendVerificationRequest'
+      responses:
+        '200':
+          description: Verification resend request processed
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/payments/initialize:
+    post:
+      tags:
+        - Payments
+      summary: Initialize a wallet funding payment
+      description: |
+        Initializes a Paystack payment for an authenticated customer.
+        The amount is submitted in Naira and converted to integer kobo
+        for financial processing.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitializePaymentRequest'
+      responses:
+        '200':
+          description: Payment initialization processed
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Authentication required
+        '403':
+          description: Customer role required
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/payments/verify:
+    post:
+      tags:
+        - Payments
+      summary: Verify a Paystack payment
+      description: Verifies a payment and credits the customer's wallet when successful.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyPaymentRequest'
+      responses:
+        '200':
+          description: Payment verification processed
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Authentication required
+        '403':
+          description: Customer role required
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/products:
+    post:
+      tags:
+        - Products
+      summary: Create a product
+      description: |
+        Creates a draft product for the authenticated vendor.
+        Vendor ownership, currency and publication status are assigned
+        by the server.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProductRequest'
+      responses:
+        '201':
+          description: Product created
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Authentication required
+        '403':
+          description: Vendor role required
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    RegisterRequest:
+      type: object
+      required:
+        - name
+        - email
+        - password
+        - confirmPassword
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: Also limited to 72 UTF-8 bytes.
+        confirmPassword:
+          type: string
+          minLength: 1
+          description: Must match password.
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+
+    VerifyEmailRequest:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          minLength: 64
+          maxLength: 64
+          pattern: '^[a-fA-F0-9]{64}$'
+
+    ResendVerificationRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 150
+
+    InitializePaymentRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - amount
+        - idempotencyKey
+      properties:
+        amount:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          multipleOf: 0.01
+          description: Payment amount in Naira, with at most two decimal places.
+          example: 500.00
+        idempotencyKey:
+          type: string
+          minLength: 16
+          maxLength: 150
+
+    VerifyPaymentRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - reference
+      properties:
+        reference:
+          type: string
+          minLength: 1
+          maxLength: 150
+
+    CreateProductRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - description
+        - category
+        - priceKobo
+        - stockQuantity
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 150
+        description:
+          type: string
+          minLength: 20
+          maxLength: 5000
+        category:
+          type: string
+          minLength: 2
+          maxLength: 80
+        priceKobo:
+          type: integer
+          minimum: 1
+          description: Product price in integer Nigerian kobo.
+          example: 2500000
+        stockQuantity:
+          type: integer
+          minimum: 0
+          example: 25
+        imageUrls:
+          type: array
+          maxItems: 8
+          items:
+            type: string
+            format: uri
+            maxLength: 2048
+
+  responses:
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                example: false
+              message:
+                type: string
+              errors:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    field:
+                      type: string
+                    message:
+                      type: string
+
+    ServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                example: false
+              message:
+                type: string

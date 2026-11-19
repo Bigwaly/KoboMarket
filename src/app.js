@@ -13,6 +13,9 @@ const authRoutes = require('./modules/auth/routes/auth.routes');
 // Load the payment routes.
 const paymentRoutes = require('./modules/payments/routes/payment.routes');
 
+// Load the product routes.
+const productRoutes = require('./modules/products/routes/product.routes');
+
 // Create the Express application.
 const app = express();
 
@@ -70,6 +73,12 @@ app.use('/api/auth', authRoutes);
 // Example:
 // POST /api/payments/initialize
 app.use('/api/payments', paymentRoutes);
+
+// All product endpoints begin with /api/products.
+//
+// Example:
+// POST /api/products
+app.use('/api/products', productRoutes);
 
 // --------------------------------------------------
 // STEP 5: NOT FOUND HANDLER
